@@ -1,5 +1,5 @@
 tic;
-filePath = 'C:\Users\baptiste\Documents\MATLAB\foraging\dragoiexp\';
+filePath = 'C:\Users\baptiste\Documents\MATLAB\foraging\dragoiexp\data\';
 
 sessionName = 'Mo_noPert_April24';
 load([filePath sessionName '.mat']);

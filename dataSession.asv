@@ -1,0 +1,239 @@
+
+%% open NEV file and extract data
+
+classdef dataSession < handle
+  
+    %% properties
+    
+    % private constants
+    properties (Access = private, Constant = true)
+        eyeDataFormat = '%f\t';
+        eyeEvent = 129;
+        eyeFPS = 30;
+        r2gWeight = [0.3,0.6,0.1];
+        sceneSize = [960,480];
+    end
+    
+    % private variables
+	properties (Access = private)
+        NEVfile;
+        AVIfile;
+    end
+    
+    % public variables
+	properties (SetAccess = protected)
+        % settings
+        velocityThreshold = 10; eyeFilter = 10; RFsize = 50;
+        calibX = [0;1]; calibY = [0;1];
+        % data variables
+        eyeT; eyeX; eyeY; eyeP; eyeTraw; eyeXraw; eyeYraw; eyePraw;
+        eyeXdot; eyeYdot; eyePdot; eyeA; eyeE; scene;
+        treatsLoc; pupilLoc; blinksTrimmed; saccadesTrimmed;
+    end
+    
+
+    %% public methods
+	methods (Access = public)
+		
+        % constructor
+		function [ obj ] = dataSession(dataPath, NEVfile, AVIfile)
+            % set constants
+            obj.NEVfile = fullfile(dataPath,NEVfile);
+			obj.AVIfile = fullfile(dataPath,AVIfile);
+            % open data files
+            try 
+                
+            catch exception
+                error('Failed to open files with exception:\n%s',exception.message)
+            end
+        end
+        
+		% destructor
+		function [] = delete(obj)
+			try
+                clearvars obj;
+            catch exception
+                error('Failed to close files properly with exception:\n%s',exception.message)
+			end
+        end
+        
+        % change default variables
+		function setVar(obj,varargin)
+            if ~mod(nargin,2)
+                error('Incorrect number of arguments when setting properties');
+            end
+            for aa=1:nargin/2
+                if ~isprop(obj,varargin{aa*2-1})
+                    error('Unknown property');
+                else
+                   obj.(varargin{aa*2-1}) = varargin{aa*2};
+                end
+            end
+        end
+        
+		% unpack eye position
+		function unpackEye(obj)
+            load(obj.NEVfile,'NEV');
+            isEye = (NEV.Data.SerialDigitalIO.InsertionReason==obj.eyeEvent);
+            tmp = char(NEV.Data.SerialDigitalIO.UnparsedData(isEye));
+            tmp = sscanf(tmp,obj.eyeDataFormat);
+            tmp = reshape(tmp,6,size(tmp,1)/6)';
+            tmpt =  tmp(:,4)*60 + tmp(:,5) + tmp(:,6)/obj.eyeFPS;
+            tmp([tmpt(2:end)==tmpt(1:end-1);false],:) = [];
+            obj.eyeT = tmp(:,4)*60 + tmp(:,5) + tmp(:,6)/obj.eyeFPS;
+            obj.eyeX = tmp(:,1); obj.eyeY = tmp(:,2); obj.eyeP = tmp(:,3);
+            obj.eyeTraw = obj.eyeT; obj.eyeXraw = obj.eyeX;
+            obj.eyeYraw = obj.eyeY; obj.eyePraw = obj.eyeP;
+            clearvars NEV
+        end
+        
+        % filter eye position
+		function filterEye(obj)
+            filtVec = normpdf(-5*obj.eyeFilter:+5*obj.eyeFilter,0,obj.eyeFilter);
+            obj.eyeT = obj.eyeT(5*obj.eyeFilter+(1:length(obj.eyeT)-10*obj.eyeFilter));
+            obj.eyeX = conv(obj.eyeX,filtVec,'valid');
+            obj.eyeY = conv(obj.eyeY,filtVec,'valid');
+            obj.eyeP = conv(obj.eyeP,filtVec,'valid');
+        end
+        
+        % compute eye velocity
+		function processVelocity(obj)
+            obj.eyeXdot = [0; (obj.eyeX(2:end)-obj.eyeX(1:end-1)) ./ (obj.eyeT(2:end)-obj.eyeT(1:end-1))];
+            obj.eyeYdot = [0; (obj.eyeY(2:end)-obj.eyeY(1:end-1)) ./ (obj.eyeT(2:end)-obj.eyeT(1:end-1))];
+            obj.eyePdot = [0; (obj.eyeP(2:end)-obj.eyeP(1:end-1)) ./ (obj.eyeT(2:end)-obj.eyeT(1:end-1))];
+        end
+        
+        % remove blinks
+		function cleanBlinks(obj)
+         	blinks = (obj.eyeX==0)|(obj.eyeY==0)|(obj.eyeP==0);
+            obj.eyeX(blinks) = interp1(obj.eyeT(~blinks),obj.eyeX(~blinks),obj.eyeT(blinks));
+            obj.eyeY(blinks) = interp1(obj.eyeT(~blinks),obj.eyeY(~blinks),obj.eyeT(blinks));
+            obj.blinksTrimmed = sum(blinks);
+        end
+        
+        % remove saccades
+		function cleanSaccades(obj)
+         	saccades = (obj.eyeXdot.^2 + obj.eyeYdot.^2) > obj.velocityThreshold.^2;
+            obj.eyeT(saccades) = NaN; obj.eyeX(saccades) = NaN;
+            obj.eyeY(saccades) = NaN; obj.eyeP(saccades) = NaN;
+            obj.saccadesTrimmed = sum(saccades);
+        end
+        
+        % convert to angles
+		function angleConversion(obj)
+            obj.pupilLoc = [0,0,0;0,900,0;0,900,200;0,0,200];
+            obj.treatsLoc = [0,0,0;0,960,0;0,960,480;0,0,480];
+            obj.calibX = [ones(size(obj.pupilLoc(:,2))),obj.pupilLoc(:,2)]\obj.treatsLoc(:,2);
+            obj.calibY = [ones(size(obj.pupilLoc(:,3))),obj.pupilLoc(:,3)]\obj.treatsLoc(:,3);
+            obj.eyeA = [ones(size(obj.eyeX)),obj.eyeX]*obj.calibX;
+            obj.eyeE = [ones(size(obj.eyeY)),obj.eyeY]*obj.calibY;
+        end
+        
+        % tag treats
+		function tagTreats(obj)
+            h_fig = figure(10);
+            h_pause = uicontrol('style','pushbutton','position',[10,10,100,40],'string','Play','callback',@pause);
+            h_tag = uicontrol('style','pushbutton','position',[120,10,100,40],'string','Tag','callback',@tag);
+            h_validate = uicontrol('style','pushbutton','position',[230,10,100,40],'string','Validate','callback',@validate);
+            h_exit = uicontrol('style','pushbutton','position',[340,10,100,40],'string','Exit','callback',@exit);
+            h_slide = uicontrol('style','slider','Min',0,'Max',1,'Value',0,'position',[10,60,440,20],'callback',@move);
+            set(h_pause,'Enable','on'); set(h_tag,'Enable','on');
+            set(h_validate,'Enable','off'); set(h_slide,'Enable','off');
+            h_cursor = datacursormode(h_fig);
+            set(h_cursor,'UpdateFcn',@tagLocation,'DisplayStyle','window');
+            
+            vreader = VideoReader(obj.AVIfile);
+            nFrames = vreader.NumberOfFrames;
+            ff = 1; fDir = 0; keepPlaying = 0; treat = 0;
+            axes('Position',[0,0.1,1,1]);
+            imshow(vreader.read(ff)); drawnow;
+            
+            uiwait(h_fig);
+            close(findobj('Number',10));
+            h_pause.delete; h_tag.delete; h_validate.delete; h_exit.delete; h_slide.delete; h_fig.delete;
+          	
+            function pause(source,event)
+                if(strcmp(get(h_pause,'String'),'Play'))
+                    set(h_pause,'String','Pause'); set(h_tag,'Enable','off');
+                    set(h_validate,'Enable','off'); set(h_slide,'Enable','on');
+                    h_cursor.enable = 'off';
+                    fDir = 1; keepPlaying = 1; play;
+                else
+                    set(h_pause,'String','Play'); set(h_tag,'Enable','on');
+                    set(h_slide,'Enable','off');
+                    fDir = 0; keepPlaying = 0;
+                end
+            end
+            function play
+                while keepPlaying
+                    ff = max(min(ff+fDir,nFrames),1);
+                    frame = vreader.read(ff); imshow(frame); drawnow;
+                end
+            end
+            function move(source,event)
+                ff = fix(nFrames*source.Value);
+            end
+            function tag(source,event)
+                if strcmp(h_cursor.enable,'on')
+                    h_cursor.enable = 'off';
+                    set(h_validate,'Enable','off');
+                else
+                    h_cursor.enable = 'on';
+                end
+            end
+            function output_txt = tagLocation(obj,event_obj)
+                pos = get(event_obj,'Position');
+                output_txt = sprintf('\tX: %i\n\tY: %i',pos(1),pos(2));
+                set(h_validate,'Enable','on');
+            end
+            function validate(source,event)
+                inf = getCursorInfo(h_cursor);
+                treat = treat+1; obj.treatsLoc(treat,:) = [ff,inf.Position];
+                obj.pupilLoc(treat,:) = [ff,obj.eyeX(ff),obj.eyeY(ff)];
+                h_cursor.enable = 'off';
+                set(h_validate,'Enable','off');
+            end
+            function exit(source,event)
+                keepPlaying = 0; uiresume(h_fig);
+            end
+        end
+        
+        % unpack scene video
+		function unpackScene(obj)
+            [pixelX,pixelY] = meshgrid(1:obj.sceneSize(1),1:obj.sceneSize(2));
+            vreader = VideoReader(obj.AVIfile);
+            nFrames = 500;%vreader.NumberOfFrames;
+                pixelX  = max(round(obj.eyeX(ff)-0.5*obj.RFsize),1):min(round(obj.eyeX(ff)+0.5*obj.RFsize),obj.sceneSize(1));
+                pixelX  = max(round(obj.eyeY(ff)-0.5*obj.RFsize),1):min(round(obj.eyeY(ff)+0.5*obj.RFsize),obj.sceneSize(2));
+                tmp = 
+                if obj.eyeX(ff)>0.5*obj*RFsize
+                distMat = sqrt((pixelX-obj.eyeX(ff)).^2+(pixelY-obj.eyeY(ff)).^2);
+                fprintf('\nRead video %i%%',round(100*ff/nFrames));
+                obj.scene(:,:,ff) = rgb2gray(vreader.read(ff));
+            end
+        end
+        
+    end
+    
+    
+    %% private methods
+    methods (Access = private)
+        
+%         function playScene(source,event)
+%             vreader = VideoReader(obj.AVIfile);
+%             while hasFrame(vreader)
+%                 frame = readFrame(vreader);
+%                 figure(1)
+%                 image(frame);
+%                 drawnow;
+%             end
+%         end
+        
+%         % convert rgb to gray
+%         function gray = rgb2gray(rgb)
+%             gray = obj.r2gWeight(1).*rgb(:,:,1) + obj.r2gWeight(2).*rgb(:,:,2) + obj.r2gWeight(3).*rgb(:,:,3);
+%         end
+        
+    end
+    
+end
